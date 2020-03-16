@@ -20,7 +20,7 @@ INITUSERKEY="./id_rsa.pub"
 INITUSERNAME="salt"
 INSTALLDEPS=""
 OUTPUT="./debian"
-PASSWORD="debian"
+PASSWORD=""
 PROXY=""
 TEMPDIR="$(pwd)/tmp"
 VERSION="buster"
@@ -37,126 +37,130 @@ Arguments:
   -l                        enable LUKS for image
   -m [machine]              type of machine (cloud, nspawn, qemu, physical-disk, physical-path, pxe)
   -o [path]                 output directory (nspawn, physical-path, pxe), target disk (physical-disk) or filename without extension (all others) (default: ${OUTPUT})
-  -p [password]             root password (default: debian)
+  -p [password]             root password (default: none)
   -s [size]                 image size (default: 10G)
   -t [path]                 temporary files directory (default: ./tmp)
   -u [username]             username for initial user (default: salt)
   -uk [filename]            filename for SSH public key to add to initial user (default: ./id_rsa.pub)
   -uh [path]                home dir for initial user (default: /var/lib/salt)
-  -v [version]              debian version to install (default: buster)"
-  exit 0
+    -v [version]              debian version to install (default: buster)"
+    exit 0
 }
 
 function provision() {
-  if [ ${FEATFORMAT} ]; then
-    if [ ! -e /dev/lvm/root ]; then
-      parted "${OUTPUT}" mklabel gpt
-      parted "${OUTPUT}" mkpart primary fat32 1MiB 200MiB
-      parted "${OUTPUT}" set 1 esp on
-      mkfs.vfat -n efi /dev/vda1
-      parted "${OUTPUT}" mkpart primary 200MiB 100%
-      if [ ${FEATLUKS} ]; then
-        cryptsetup --label luks -v luksFormat --type luks2 /dev/vda2
-        cryptsetup open /dev/disk/by-label/luks luks
-        vgcreate lvm /dev/mapper/luks
-      else
-        vgcreate lvm "${OUTPUT}2"
-      fi
-      lvcreate -n swap -L "$(dmidecode -t 17 | grep 'Size.*MB' | awk '{s+=$2} END {print s / 1024}')G" lvm
-      mkswap -L swap /dev/lvm/swap
-      lvcreate -n root -l "20%VG" lvm
-      mkfs.ext4 -L root /dev/lvm/root
-      lvcreate -n home -l "100%FREE" lvm
-      mkfs.ext4 -L home /dev/lvm/home
+    if [ ${FEATFORMAT} ]; then
+        if [ ! -e /dev/lvm/root ]; then
+            parted "${OUTPUT}" mklabel gpt
+            parted "${OUTPUT}" mkpart primary fat32 1MiB 200MiB
+            parted "${OUTPUT}" set 1 esp on
+            mkfs.vfat -n efi "${OUTPUT}1"
+            parted "${OUTPUT}" mkpart primary 200MiB 100%
+            if [ ${FEATLUKS} ]; then
+                cryptsetup --label luks -v luksFormat --type luks2 "${OUTPUT}2"
+                cryptsetup open /dev/disk/by-label/luks luks
+                vgcreate lvm /dev/mapper/luks
+            else
+                vgcreate lvm "${OUTPUT}2"
+            fi
+            lvcreate -n swap -L "$(dmidecode -t 17 | grep 'Size.*MB' | awk '{s+=$2} END {print s / 1024}')G" lvm
+            mkswap -L swap /dev/lvm/swap
+            lvcreate -n root -l "20%VG" lvm
+            mkfs.ext4 -L root /dev/lvm/root
+            lvcreate -n home -l "100%FREE" lvm
+            mkfs.ext4 -L home /dev/lvm/home
+        fi
+        if [ ${FEATLUKS} ] && [ ! -e /dev/mapper/luks ]; then
+            cryptsetup open /dev/disk/by-label/luks luks
+        fi
+        mount /dev/disk/by-label/root /mnt || true
+        mkdir -p /mnt/boot/efi
+        mount /dev/disk/by-label/efi /mnt/boot/efi || true
+        mkdir -p /mnt/home
+        mount /dev/disk/by-label/home /mnt/home || true
+        swapon /dev/disk/by-label/swap || true
+        OUTPUT=/mnt
     fi
-    if [ ${FEATLUKS} ] && [ ! -e /dev/mapper/luks ]; then
-      cryptsetup open /dev/disk/by-label/luks luks
+    
+    if [ ${FEATIMAGE} ]; then
+        INCLUDE="parted,${INCLUDE}"
+        IMAGENAME="${OUTPUT}.${FEATIMAGEFORMAT}"
+        if [ ! -e "${IMAGENAME}" ]; then
+            qemu-img create -f "${FEATIMAGEFORMAT}" "${IMAGENAME}" "${FEATIMAGESIZE}"
+            modprobe nbd max_part=4
+            qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
+            
+            sleep 1
+            
+            if [ ${FEATEFI} ]; then
+                parted /dev/nbd0 mklabel gpt
+                parted /dev/nbd0 mkpart primary fat32 1MiB 200MiB
+                parted /dev/nbd0 set 1 esp on
+                parted /dev/nbd0 mkpart primary ext4 200MIB 100%
+            else
+                parted /dev/nbd0 mklabel msdos
+                parted /dev/nbd0 mkpart primary ext4 1MiB 100%
+                parted /dev/nbd0 set 1 boot on
+                INCLUDE="grub2,${INCLUDE}"
+            fi
+            
+            if [ ${FEATEFI} ]; then
+                mkfs.vfat -n "efi" /dev/nbd0p1
+            fi
+            
+            mkfs.ext4 -L "root" ${FEATIMAGEROOT}
+            qemu-nbd -d /dev/nbd0
+        fi
+        
+        qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
+        sleep 1
+        
+        mkdir -p "${TEMPDIR}"
+        mount ${FEATIMAGEROOT} "${TEMPDIR}"
+        
+        if [ ${FEATEFI} ]; then
+            mkdir -p "${TEMPDIR}/boot/efi"
+            mount /dev/nbd0p2 "${TEMPDIR}/boot/efi"
+        fi
     fi
-    mount /dev/disk/by-label/root /mnt || true
-    mkdir -p /mnt/boot/efi
-    mount /dev/disk/by-label/efi /mnt/boot/efi || true
-    mkdir -p /mnt/home
-    mount /dev/disk/by-label/home /mnt/home || true
-    swapon /dev/disk/by-label/swap || true
-    OUTPUT=/mnt
-  fi
-
-  if [ ${FEATIMAGE} ]; then
-    INCLUDE="parted,${INCLUDE}"
-    IMAGENAME="${OUTPUT}.${FEATIMAGEFORMAT}"
-    if [ ! -e "${IMAGENAME}" ]; then
-      qemu-img create -f "${FEATIMAGEFORMAT}" "${IMAGENAME}" "${FEATIMAGESIZE}"
-      modprobe nbd max_part=4
-      qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
-
-      sleep 1
-
-      if [ ${FEATEFI} ]; then
-        parted /dev/nbd0 mklabel gpt
-        parted /dev/nbd0 mkpart primary fat32 1MiB 200MiB
-        parted /dev/nbd0 set 1 esp on
-        parted /dev/nbd0 mkpart primary ext4 200MIB 100%
-      else
-        parted /dev/nbd0 mklabel msdos
-        parted /dev/nbd0 mkpart primary ext4 1MiB 100%
-        parted /dev/nbd0 set 1 boot on
-        INCLUDE="grub2,${INCLUDE}"
-      fi
-
-      if [ ${FEATEFI} ]; then
-        mkfs.vfat -n "efi" /dev/nbd0p1
-      fi
-
-      mkfs.ext4 -L "root" ${FEATIMAGEROOT}
-      qemu-nbd -d /dev/nbd0
-    fi
-
-    qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
-    sleep 1
-
-    mkdir -p "${TEMPDIR}"
-    mount ${FEATIMAGEROOT} "${TEMPDIR}"
-
-    if [ ${FEATEFI} ]; then
-      mkdir -p "${TEMPDIR}/boot/efi"
-      mount /dev/nbd0p2 "${TEMPDIR}/boot/efi"
-    fi
-  fi
 }
 
 function install() {
-  if [ "${FEATDIRECT}" ]; then
-    TEMPDIR="${OUTPUT}"
-  fi
+    if [ "${FEATDIRECT}" ]; then
+        TEMPDIR="${OUTPUT}"
+    fi
 
-  if [ "${FEATLUKS}" ]; then
-    INCLUDE="cryptsetup,cryptsetup-initramfs,lvm2"
-  fi
-
-  if [ "${FEATLINUXAMD64}" ]; then
-    INCLUDE="linux-image-amd64,${INCLUDE}"
-  fi
-
-  if [ "${FEATSQUASH}" ]; then
-    INCLUDE="cryptsetup,debootstrap,dosfstools,live-boot,lvm2,parted,${INCLUDE}"
-  fi
-
-  if [ ! -e "${TEMPDIR}/bin" ]; then
-    debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,jq,libpam-systemd,locales,openssh-server,policykit-1,python-apt,sudo,usrmerge,unzip,"${INCLUDE}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${EXCLUDE}" "${VERSION}" "${TEMPDIR}" "http://${PROXY}deb.debian.org/debian"
-  fi
+    if [ "${FEATFORMAT}" ]; then
+        INCLUDE="lvm2,${INCLUDE}"
+    fi
+    
+    if [ "${FEATLUKS}" ]; then
+        INCLUDE="cryptsetup,cryptsetup-initramfs,${INCLUDE}"
+    fi
+    
+    if [ "${FEATLINUXAMD64}" ]; then
+        INCLUDE="linux-image-amd64,${INCLUDE}"
+    fi
+    
+    if [ "${FEATSQUASH}" ]; then
+        INCLUDE="cryptsetup,debootstrap,dosfstools,firmware-linux,firmware-iwlwifi,live-boot,lvm2,parted,${INCLUDE}"
+    fi
+    
+    if [ ! -e "${TEMPDIR}/bin" ]; then
+        debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,jq,libpam-systemd,locales,openssh-server,policykit-1,python-apt,sudo,usrmerge,unzip,"${INCLUDE}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${EXCLUDE}" "${VERSION}" "${TEMPDIR}" "http://${PROXY}deb.debian.org/debian"
+    fi
 }
 
 function configure() {
-  rm -f "${TEMPDIR}/etc/hostname" || true
-
-  if [ "${FEATCONTAINER}" ]; then
-    rm "${TEMPDIR}/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service" || true
-  fi
-
+    rm -f "${TEMPDIR}/etc/hostname" || true
+    
+    if [ "${FEATCONTAINER}" ]; then
+        rm "${TEMPDIR}/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service" || true
+    fi
+    
   cat > "${TEMPDIR}/usr/sbin/policy-rc.d" << EOF
 exit 101
 EOF
-
+    
   cat > "${TEMPDIR}/etc/systemd/network/default.network" << EOF
 [Match]
 Name=!lo
@@ -164,50 +168,52 @@ Name=!lo
 [Network]
 DHCP=yes
 EOF
-
-  # Enable services
-  for service in polkit systemd-networkd systemd-networkd-wait-online systemd-resolved; do
-    ln -s "/lib/systemd/system/${service}.service" "${TEMPDIR}/etc/systemd/system/multi-user.target.wants" || true
-  done
-
-  # Remove timers
-  rm "${TEMPDIR}/etc/systemd/system/timers.target.wants/"* || true
-
-  # Setup resolved
-  ln -sf /run/systemd/resolve/resolv.conf "${TEMPDIR}/etc/resolv.conf"
-  mkdir -p "${TEMPDIR}/etc/systemd/resolved.conf.d"
+    
+    # Enable services
+    for service in polkit systemd-networkd systemd-networkd-wait-online systemd-resolved; do
+        ln -s "/lib/systemd/system/${service}.service" "${TEMPDIR}/etc/systemd/system/multi-user.target.wants" || true
+    done
+    
+    # Remove timers
+    rm "${TEMPDIR}/etc/systemd/system/timers.target.wants/"* || true
+    
+    # Setup resolved
+    ln -sf /run/systemd/resolve/resolv.conf "${TEMPDIR}/etc/resolv.conf"
+    mkdir -p "${TEMPDIR}/etc/systemd/resolved.conf.d"
   cat > "${TEMPDIR}/etc/systemd/resolved.conf.d/fallback.conf" << EOF
 [Resolve]
 FallbackDNS=1.1.1.1
 EOF
-
-  # Edit sources
+    
+    # Edit sources
   cat > "${TEMPDIR}/etc/apt/sources.list" << EOF
 deb http://${PROXY}deb.debian.org/debian ${VERSION} main contrib non-free
 EOF
-  if [ ${VERSION} = "buster" ]; then
+    if [ ${VERSION} = "buster" ]; then
   cat >> "${TEMPDIR}/etc/apt/sources.list" << EOF
 deb http://${PROXY}deb.debian.org/debian ${VERSION}-backports main contrib non-free
 deb http://${PROXY}deb.debian.org/debian ${VERSION}-updates main contrib non-free
 deb http://${PROXY}security.debian.org/debian-security ${VERSION}/updates main contrib non-free
 EOF
-  fi
-
-  # Create user
-  chroot "${TEMPDIR}" useradd -c "${INITUSERNAME}" -d "${INITUSERHOME}" -mu 2000 "${INITUSERNAME}" || true
-  chroot "${TEMPDIR}" groupadd -g 3000 admins || true
-  echo '%admins ALL=(ALL) NOPASSWD: ALL' > "${TEMPDIR}"/etc/sudoers.d/sudoers
-  chroot "${TEMPDIR}" gpasswd -a "${INITUSERNAME}" admins || true
-  chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
-  chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
-  chroot "${TEMPDIR}" touch "${INITUSERHOME}"/.ssh/authorized_keys
-  chroot "${TEMPDIR}" chown "${INITUSERNAME}:${INITUSERNAME}" "${INITUSERHOME}/.ssh"
-  cp "${INITUSERKEY}" "${TEMPDIR}${INITUSERHOME}"/.ssh/authorized_keys
-
-  # Set root password
-  echo "root:${PASSWORD}" | chpasswd -R "${TEMPDIR}"
-
-  if [ ${FEATIMAGE} ]; then
+    fi
+    
+    # Create user
+    chroot "${TEMPDIR}" useradd -c "${INITUSERNAME}" -d "${INITUSERHOME}" -mu 2000 "${INITUSERNAME}" || true
+    chroot "${TEMPDIR}" groupadd -g 3000 admins || true
+    echo '%admins ALL=(ALL) NOPASSWD: ALL' > "${TEMPDIR}"/etc/sudoers.d/sudoers
+    chroot "${TEMPDIR}" gpasswd -a "${INITUSERNAME}" admins || true
+    chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
+    chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
+    chroot "${TEMPDIR}" touch "${INITUSERHOME}"/.ssh/authorized_keys
+    chroot "${TEMPDIR}" chown "${INITUSERNAME}:${INITUSERNAME}" "${INITUSERHOME}/.ssh"
+    cp "${INITUSERKEY}" "${TEMPDIR}${INITUSERHOME}"/.ssh/authorized_keys
+    
+    # Set root password
+    if [ "${PASSWORD}" ]; then
+        echo "root:${PASSWORD}" | chpasswd -R "${TEMPDIR}"
+    fi
+    
+    if [ ${FEATIMAGE} ]; then
       cat > "${TEMPDIR}/etc/systemd/system/growroot.service" << EOF
 [Unit]
 Description=Grow root partition
@@ -220,14 +226,14 @@ ExecStart=/usr/sbin/resize2fs /dev/vda1
 [Install]
 WantedBy=multi-user.target
 EOF
-      ln -s /etc/systemd/system/growroot.service "${TEMPDIR}/etc/systemd/system/multi-user.target.wants/" || true
-  fi
+        ln -s /etc/systemd/system/growroot.service "${TEMPDIR}/etc/systemd/system/multi-user.target.wants/" || true
+    fi
 }
 
 function finalize() {
-  chroot "${TEMPDIR}" apt clean
-  if [ "${FEATEFI}" ]; then
-    # Setup EFI copy
+    chroot "${TEMPDIR}" apt clean
+    if [ "${FEATEFI}" ]; then
+        # Setup EFI copy
     cat > "${TEMPDIR}/etc/systemd/system/efi.service" << EOF
 [Unit]
 Description=Copy initramfs and vmlinuz to EFI System Partitions
@@ -237,7 +243,7 @@ Type=oneshot
 ExecStart=/bin/cp /initrd.img /boot/efi/initrd.img
 ExecStart=/bin/cp /vmlinuz /boot/efi/vmlinuz
 EOF
-
+        
     cat > "${TEMPDIR}/etc/systemd/system/efi.path" << EOF
 [Unit]
 Description=Copy initramfs and vmlinuz to EFI System Partitions
@@ -249,103 +255,108 @@ PathChanged=/vmlinuz
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    ln -s /etc/systemd/system/efi.path "${TEMPDIR}/etc/systemd/system/multi-user.target.wants/" || true
-    
-    # Setup systemd-bootd
-    if [ ! -e "${TEMPDIR}/boot/efi/loader" ]; then
-      bootctl --path "${TEMPDIR}/boot/efi" install
-    fi
-    
-    echo "default debian" > "${TEMPDIR}/boot/efi/loader/loader.conf"
-    
+        
+        ln -s /etc/systemd/system/efi.path "${TEMPDIR}/etc/systemd/system/multi-user.target.wants/" || true
+        
+        # Setup systemd-bootd
+        if [ ! -e "${TEMPDIR}/boot/efi/loader" ]; then
+            bootctl --path "${TEMPDIR}/boot/efi" install
+        fi
+        
+        echo "default debian" > "${TEMPDIR}/boot/efi/loader/loader.conf"
+        
     cat > "${TEMPDIR}/boot/efi/loader/entries/debian.conf" << EOF
 title Debian
 linux /vmlinuz
 initrd /initrd.img
 EOF
-
-    if [ "${FEATLUKS}" ]; then
+        
+        if [ "${FEATLUKS}" ]; then
       cat >> "${TEMPDIR}/boot/efi/loader/entries/debian.conf" << EOF
 options cryptdevice=LABEL=luks:luks resume=LABEL=swap root=LABEL=root rw
 EOF
-
+            
       cat >> "${TEMPDIR}/etc/crypttab" << EOF
 luks LABEL=luks none luks
 EOF
-      mount -o bind /dev "${TEMPDIR}/dev"
-      mount -t sysfs /sys "${TEMPDIR}/sys"
-      mount -t proc /proc "${TEMPDIR}/proc"
-      chroot "${TEMPDIR}" update-initramfs -u
-      umount "${TEMPDIR}/dev"
-      umount "${TEMPDIR}/sys"
-      umount "${TEMPDIR}/proc"
-    elif [ "${FEATFORMAT}" ]; then
+            mount -o bind /dev "${TEMPDIR}/dev"
+            mount -t sysfs /sys "${TEMPDIR}/sys"
+            mount -t proc /proc "${TEMPDIR}/proc"
+            chroot "${TEMPDIR}" update-initramfs -u
+            umount "${TEMPDIR}/dev"
+            umount "${TEMPDIR}/sys"
+            umount "${TEMPDIR}/proc"
+            elif [ "${FEATFORMAT}" ]; then
       cat >> "${TEMPDIR}/boot/efi/loader/entries/debian.conf" << EOF
 options resume=LABEL=swap root=LABEL=root rw
 EOF
-
-    else
+            
+        else
       cat >> "${TEMPDIR}/boot/efi/loader/entries/debian.conf" << EOF
-options console=tty0 console=ttyS0 elevator=noop root=LABEL=root rw
+options elevator=noop root=LABEL=root rw
 EOF
+        fi
+        
+        cp "${TEMPDIR}/initrd.img" "${TEMPDIR}/boot/efi/initrd.img"
+        cp "${TEMPDIR}/vmlinuz" "${TEMPDIR}/boot/efi/vmlinuz"
     fi
-
-    cp "${TEMPDIR}/initrd.img" "${TEMPDIR}/boot/efi/initrd.img"
-    cp "${TEMPDIR}/vmlinuz" "${TEMPDIR}/boot/efi/vmlinuz"
-  fi
-
-  if [ "${FEATIMAGE}" ]; then
-    if [ "${FEATEFI}" ]; then
+    
+    if [ "${FEATIMAGE}" ]; then
+        if [ "${FEATEFI}" ]; then
       cat > "${TEMPDIR}/etc/fstab" << EOF
 LABEL=efi /boot/efi vfat defaults 0 1
 LABEL=root / ext4 defaults,noatime 0 1
 EOF
-      umount /dev/nbd0p2
-    else
+            umount /dev/nbd0p2
+        else
       cat > "${TEMPDIR}/etc/fstab" << EOF
 LABEL=root / ext4 defaults,noatime 0 1
 EOF
-      mount -o bind /dev "${TEMPDIR}/dev"
-      mount -t proc /proc "${TEMPDIR}/proc"
-      mount -t sysfs /sys "${TEMPDIR}/sys"
-      sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
-      sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
-      sed -i 's/GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0"/g' "${TEMPDIR}/etc/default/grub"
-      chroot "${TEMPDIR}" grub-install /dev/nbd0
-      chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
+            mount -o bind /dev "${TEMPDIR}/dev"
+            mount -t proc /proc "${TEMPDIR}/proc"
+            mount -t sysfs /sys "${TEMPDIR}/sys"
+            sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
+            sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
+            chroot "${TEMPDIR}" grub-install /dev/nbd0
+            chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
+        fi
+        umount -R "${TEMPDIR}"
+        rmdir "${TEMPDIR}"
+        qemu-nbd -d /dev/nbd0
     fi
-    umount -R "${TEMPDIR}"
-    rmdir "${TEMPDIR}"
-    qemu-nbd -d /dev/nbd0
-  fi
-
-  if [ "${FEATSQUASH}" ]; then
-    mkdir -p "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d"
+    
+    if [ "${FEATSQUASH}" ]; then
+        mkdir -p "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d"
     cat > "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d/override.conf" << EOF
 [Service]
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I 38400 linux
 EOF
-    mkdir -p "${TEMPDIR}/etc/systemd/system/serial-getty@ttyS0.service.d"
-    cp -R "${TEMPDIR}/etc/systemd/system/serial-getty@ttyS0.service.d" "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d"
-    cp -R "${DIR}/forge.sh" "${TEMPDIR}/usr/local/bin/forge.sh"
+        mkdir -p "${TEMPDIR}/etc/systemd/system/serial-getty@ttyS0.service.d"
+        # Include additional squash modules
+    cat > "${TEMPDIR}/etc/initramfs-tools/modules" << EOF
+asix
+iwlwifi
+usbnet
+EOF
+        cp -R "${TEMPDIR}/etc/systemd/system/serial-getty@ttyS0.service.d" "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d"
+        cp -R "${DIR}/forge.sh" "${TEMPDIR}/usr/local/bin/forge.sh"
     mkdir -p "${OUTPUT}"
+    curl -L https://cdimage.debian.org/cdimage/unofficial/non-free/firmware/stable/current/firmware.cpio.gz -o "${TEMPDIR}/firmware.cpio.gz"
+    cat "${TEMPDIR}/initrd.img" "${TEMPDIR}/firmware.cpio.gz" > "${OUTPUT}/initrd.img"
+    cp "${TEMPDIR}/vmlinuz" "${OUTPUT}/vmlinuz"
     mksquashfs "${TEMPDIR}" "${OUTPUT}/root.squashfs" -e boot
-    cp -R /boot/efi/EFI "${TEMPDIR}/EFI"
-    mkdir -p "${TEMPDIR}/loader/entries"
-    cat >> "${TEMPDIR}/loader/loader.conf" << EOF
+    cp -R /boot/efi/EFI "${OUTPUT}/EFI"
+    mkdir -p "${OUTPUT}/loader/entries"
+    cat >> "${OUTPUT}/loader/loader.conf" << EOF
 default Debian
 EOF
-    cat >> "${TEMPDIR}/loader/entries/debian.conf" << EOF
+    cat >> "${OUTPUT}/loader/entries/debian.conf" << EOF
 title Debian
 linux /vmlinuz
 initrd /initrd.img
 options boot=live fromiso=/root.squashfs toram
 EOF
-    cp "${TEMPDIR}/initrd.img" "${OUTPUT}/initrd.img"
-    cp "${TEMPDIR}/vmlinuz" "${OUTPUT}/vmlinuz"
-    rm -rf "${TEMPDIR}"
   fi
 
   if [ ${FEATFORMAT} ]; then
