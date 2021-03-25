@@ -129,6 +129,7 @@ function provision() {
 
 function install() {
   PACKAGES=""
+
   if [ "${FEATDIRECT}" ]; then
     TEMPDIR="${OUTPUT}"
   fi
@@ -142,7 +143,7 @@ function install() {
 
   if [ "${FEATIMAGE}" ]; then
     if [ "${FEATEFI}" != yes ]; then
-      PACKAGES="grub2,${PACKAGES}"
+      PACKAGES="grub2,parted,${PACKAGES}"
     fi
   fi
 
@@ -159,7 +160,7 @@ function install() {
   fi
 
   if [ ! -e "${TEMPDIR}/bin" ]; then
-    debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,jq,libpam-systemd,locales,openssh-server,policykit-1,python-apt,sudo,usrmerge,unzip,"${PACKAGES}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${EXCLUDE}" "${VERSION}" "${TEMPDIR}" "http://${PROXY}deb.debian.org/debian"
+    debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,gnupg2,jq,libpam-systemd,locales,openssh-server,policykit-1,python3-minimal,sudo,usrmerge,unzip,"${PACKAGES}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${EXCLUDE}" "${VERSION}" "${TEMPDIR}" "http://${PROXY}deb.debian.org/debian"
   fi
 }
 
@@ -234,8 +235,17 @@ EOF
 
   # Create user
   chroot "${TEMPDIR}" useradd -c "${INITUSERNAME}" -d "${INITUSERHOME}" -mu 2000 "${INITUSERNAME}" || true
-  echo '%sudo ALL=(ALL) NOPASSWD: ALL' > "${TEMPDIR}"/etc/sudoers.d/sudoers
-  chroot "${TEMPDIR}" gpasswd -a "${INITUSERNAME}" sudo || true
+  cat > "${TEMPDIR}/etc/sudoers" << EOF
+Defaults env_reset
+Defaults mail_badpass
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+root ALL=(ALL:ALL) ALL
+
+%admin ALL=(ALL) NOPASSWD: ALL
+EOF
+  chroot "${TEMPDIR}" groupadd admin || true
+  chroot "${TEMPDIR}" gpasswd -a "${INITUSERNAME}" admin || true
   chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
   chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
   chroot "${TEMPDIR}" touch "${INITUSERHOME}"/.ssh/authorized_keys
@@ -254,8 +264,8 @@ Description=Grow root partition
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/parted ---pretend-input-tty /dev/vda resizepart 1 yes 100%
-ExecStart=/usr/sbin/resize2fs /dev/vda1
+ExecStart=/bin/bash -c 'parted ---pretend-input-tty \$(mount | grep " / " | cut -d\  -f1) resizepart 1 yes 100%'
+ExecStart=/bin/bash -c 'resize2fs \$(mount | grep " / " | cut -d\  -f1)'
 
 [Install]
 WantedBy=multi-user.target
@@ -444,6 +454,10 @@ while [ $# -gt 0 ]; do
     -d)
       set -x
       shift 1
+    ;;
+    -f)
+      FEATIMAGEFORMAT="${2}"
+      shift 2
     ;;
     -h)
       show_usage
