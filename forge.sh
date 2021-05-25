@@ -2,127 +2,142 @@
 set -eo pipefail
 
 ADDITIONAL=""
+APTCACHER=""
 ARCH="amd64"
+BOOTLOADER=""
+BOOTOPTIONS="elevator=noop root=LABEL=root"
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-EXCLUDE=""
-FEATCONTAINER=""
-FEATDIRECT=""
-FEATEFI=""
-FEATFORMAT=""
-FEATLINUXAMD64=""
-FEATIMAGE=""
-FEATIMAGEFORMAT="qcow2"
-FEATIMAGESIZE="10G"
-FEATIMAGEROOT="/dev/nbd0p1"
-FEATLUKS=""
-FEATSQUASH=""
-INITUSERHOME="/home/ansible"
-INITUSERKEY="./id_rsa.pub"
-INITUSERNAME="ansible"
+IMAGEFORMAT="qcow2"
+IMAGESIZE="10G"
+IMAGESWAP=""
 INSTALLDEPS=""
-NAMESERVER="1.1.1.1"
-OPTIONS="elevator=noop root=LABEL=root"
-OUTPUT="./debian"
+LUKS=""
+OUTPUTPATH="./debian"
+OUTPUTTYPE="filesystem"
 PASSWORD=""
-PROXY=""
+SQUASH=""
 TEMPDIR="$(pwd)/tmp"
-VERSION="buster"
+UBOOTVERSION="rockchip"
+USERHOME="/home/ansible"
+USERKEY="./id_rsa.pub"
+USERNAME="ansible"
+VERSION="bullseye"
+
+diskpath=""
+exclude=""
 
 function show_usage() {
-  echo "Usage: $0 [arguments]
+  echo "Usage: $0 [arguments] [disk|filesystem|image]
 
 Arguments:
-  -a [apt-cacher-address]   apt-cacher-ng proxy
-  -b                        boot options
+  -ac [apt-cacher-address]  apt-cacher-ng proxy
+  -ap [packages]            additional packages to include after install
+  -ar [architecture]        architecture (amd64, arm64) (default: ${ARCH})
+  -bl                       bootloader (bios, uboot, uefi) (default: none/no bootloader or kernel)
+  -bo                       boot options
   -d                        enable debugging
-  -f                        image format (default: qcow2)
+  -if                       image format (qcow2, raw) (default: ${IMAGEFORMAT})
+  -is [size]                image size (default: ${IMAGESIZE})
+  -iw [size]                image swap size (default: none/no swap)
   -h                        show help
-  -i [packages]             additional packages to include after install
   -l                        enable LUKS for image
-  -m [machine]              type of machine (cloud, nspawn, qemu, physical-disk, physical-path, pxe)
-  -n [nameserver]           nameserver to use (default: 1.1.1.1)
-  -o [path]                 output directory (nspawn, physical-path, pxe), target disk (physical-disk) or filename without extension (all others) (default: ${OUTPUT})
+  -o [path]                 output directory (filesystem), target disk (disk) or filename without extension (image) (default: ${OUTPUTPATH})
   -p [password]             root password (default: none)
-  -s [size]                 image size (default: 10G)
-  -t [path]                 temporary files directory (default: ./tmp)
-  -u [username]             username for initial user (default: ansible)
-  -uk [filename]            filename for SSH public key to add to initial user (default: ./id_rsa.pub)
-  -uh [path]                home dir for initial user (default: /home/ansible)
+  -s                        have output be squashfs
+  -t [path]                 temporary files directory (default: ${TEMPDIR})
+  -uh [path]                home dir for initial user (default: ${USERHOME})
+  -uk [filename]            filename for SSH public key to add to initial user (default: ${USERKEY})
+  -un [username]            username for initial user (default: ${USERNAME})
+  -uv [version]             u-boot version to install (default: ${UBOOTVERSION})
   -v [version]              debian version to install (default: buster)"
   exit 0
 }
 
 function provision() {
-  if [ ${FEATFORMAT} ]; then
+  if [ ${OUTPUTTYPE} == image ]; then
+    if [ ! -e "${OUTPUTPATH}" ]; then
+      qemu-img create -f "${IMAGEFORMAT}" "${OUTPUTPATH}" "${IMAGESIZE}"
+      modprobe nbd max_part=4
+      qemu-nbd -c /dev/nbd0 -f "${IMAGEFORMAT}" "${OUTPUTPATH}"
+
+      sleep 1
+    else
+      return
+    fi
+  fi
+
+  if [ "${diskpath}" ]; then
     if [ ! -e /dev/lvm/root ]; then
-      parted "${OUTPUT}" mklabel gpt
-      parted "${OUTPUT}" mkpart primary fat32 1MiB 200MiB
-      parted "${OUTPUT}" set 1 esp on
-      mkfs.vfat -n efi "${OUTPUT}1"
-      parted "${OUTPUT}" mkpart primary 200MiB 100%
-      if [ ${FEATLUKS} ]; then
-        cryptsetup --label luks -v luksFormat --type luks2 "${OUTPUT}2"
+      case "${BOOTLOADER}" in
+        bios)
+          parted "${diskpath}" mklabel msdos
+          parted "${diskpath}" mkpart primary 1MiB 200 MiB
+          parted "${diskpath}" set 1 boot on
+          mkfs.ext4 -L boot "${diskpath}1"
+          parted "${diskpath}" mkpart primary 200MiB 100%
+        ;;
+        uboot)
+          parted "${diskpath}" mklabel gpt
+          parted "${diskpath}" mkpart primary 1MiB 200 MiB
+          mkfs.ext4 -L boot "${diskpath}1"
+          parted "${diskpath}" mkpart primary 200MiB 100%
+        ;;
+        uefi)
+          parted "${diskpath}" mkpart primary fat32 1MiB 200MiB
+          parted "${diskpath}" set 1 esp on
+          mkfs.vfat -n efi "${diskpath}1"
+          parted "${diskpath}" mkpart primary 200MiB 100%
+        ;;
+      esac
+
+      if [ "${LUKS}" ]; then
+        cryptsetup --label luks -v luksFormat --type luks2 "${diskpath}2"
         cryptsetup open /dev/disk/by-label/luks luks
         vgcreate lvm /dev/mapper/luks
       else
-        vgcreate lvm "${OUTPUT}2"
+        vgcreate lvm "${diskpath}2"
       fi
-      lvcreate -n swap -L "$(dmidecode -t 17 | grep 'Size.*MB' | awk '{s+=$2} END {print s / 1024}')G" lvm
-      mkswap -L swap /dev/lvm/swap
-      lvcreate -n root -l "20%VG" lvm
+
+      if [ "${IMAGESWAP}" ]; then
+        lvcreate -n swap -L "${IMAGESWAP}" lvm
+        mkswap -L swap /dev/lvm/swap
+      fi
+
+      lvcreate -n root -l "100%FREE" lvm
       mkfs.ext4 -L root /dev/lvm/root
-      lvcreate -n home -l "100%FREE" lvm
-      mkfs.ext4 -L home /dev/lvm/home
     fi
-    if [ ${FEATLUKS} ] && [ ! -e /dev/mapper/luks ]; then
-      cryptsetup open /dev/disk/by-label/luks luks
-    fi
-    mount /dev/disk/by-label/root /mnt || true
-    mkdir -p /mnt/boot/efi
-    mount /dev/disk/by-label/efi /mnt/boot/efi || true
-    mkdir -p /mnt/home
-    mount /dev/disk/by-label/home /mnt/home || true
-    swapon /dev/disk/by-label/swap || true
-    OUTPUT=/mnt
   fi
 
-  if [ ${FEATIMAGE} ]; then
-    IMAGENAME="${OUTPUT}.${FEATIMAGEFORMAT}"
-    if [ ! -e "${IMAGENAME}" ]; then
-      qemu-img create -f "${FEATIMAGEFORMAT}" "${IMAGENAME}" "${FEATIMAGESIZE}"
-      modprobe nbd max_part=4
-      qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
-
-      sleep 1
-
-      if [ ${FEATEFI} ]; then
-        parted /dev/nbd0 mklabel gpt
-        parted /dev/nbd0 mkpart primary fat32 1MiB 200MiB
-        parted /dev/nbd0 set 1 esp on
-        parted /dev/nbd0 mkpart primary ext4 200MIB 100%
-      else
-        parted /dev/nbd0 mklabel msdos
-        parted /dev/nbd0 mkpart primary ext4 1MiB 100%
-        parted /dev/nbd0 set 1 boot on
-      fi
-
-      if [ ${FEATEFI} ]; then
-        mkfs.vfat -n "efi" /dev/nbd0p1
-      fi
-
-      mkfs.ext4 -L "root" ${FEATIMAGEROOT}
-      qemu-nbd -d /dev/nbd0
-    fi
+  if [ "${FEATIMAGE}" ]; then
+    mkfs.ext4 -L "root" "${FEATIMAGEROOT}"
+    qemu-nbd -d /dev/nbd0
 
     qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
     sleep 1
 
-    mkdir -p "${TEMPDIR}"
-    mount ${FEATIMAGEROOT} "${TEMPDIR}"
+  fi
+}
 
-    if [ ${FEATEFI} ]; then
+function mount() {
+  mkdir -p "${TEMPDIR}"
+
+  if [ "${diskpath}" ] && ! mount | grep "${TEMPDIR}"; then
+    if [ "${OUTPUTTYPE}" == image ]; then
+      modprobe nbd max_part=4
+      qemu-nbd -c /dev/nbd0 -f "${IMAGEFORMAT}" "${OUTPUTPATH}"
+
+      sleep 1
+    fi
+
+    if [ "${LUKS}" ]; then
+      cryptsetup open /dev/disk/by-label/luks luks
+    fi
+
+    mount /dev/disk/by-label/root "${TEMPDIR}" || true
+
+    if [ "${BOOTLOADER}" == uefi ]; then
       mkdir -p "${TEMPDIR}/boot/efi"
-      mount /dev/nbd0p2 "${TEMPDIR}/boot/efi"
+      mount /dev/disk/by-label/efi "${TEMPDIR}/boot/efi" || true
     fi
   fi
 }
@@ -130,60 +145,50 @@ function provision() {
 function install() {
   PACKAGES=""
 
-  if [ "${FEATDIRECT}" ]; then
-    TEMPDIR="${OUTPUT}"
+  if [ "${BOOTLOADER}" ]; then
+    PACKAGES="linux-image-${ARCH},${PACKAGES}"
   fi
 
-  if [ "${FEATFORMAT}" ]; then
-    if [ "${FEATLUKS}" ]; then
-      OPTIONS="resume=LABEL=swap root=LABEL=root"
-    fi
-    PACKAGES="lvm2,${PACKAGES}"
+  if [ "${BOOTLOADER}" == bios ]; then
+    PACKAGES="grub2,parted,${PACKAGES}"
   fi
 
-  if [ "${FEATIMAGE}" ]; then
-    if [ "${FEATEFI}" != yes ]; then
-      PACKAGES="grub2,parted,${PACKAGES}"
-    fi
+  if [ "${BOOTLOADER}" == uboot ]; then
+    PACKAGES="u-boot-${UBOOTVERSION},${PACKAGES}"
   fi
 
-  if [ "${FEATLUKS}" ]; then
+  if [ "${LUKS}" ]; then
+    BOOTOPTIONS="resume=LABEL=swap root=LABEL=root,${BOOTOPTIONS}"
     PACKAGES="cryptsetup,cryptsetup-initramfs,${PACKAGES}"
   fi
 
-  if [ "${FEATLINUXAMD64}" ]; then
-    PACKAGES="linux-image-amd64,${PACKAGES}"
+  if [ "${diskpath}" ]; then
+    PACKAGES="lvm2,${PACKAGES}"
   fi
 
   if [ "${FEATSQUASH}" ]; then
-    PACKAGES="cryptsetup,debootstrap,dosfstools,firmware-linux,firmware-iwlwifi,live-boot,lvm2,parted,${PACKAGES}"
+    PACKAGES="cryptsetup,debootstrap,dosfstools,firmware-linux,firmware-iwlwifi,linux-image-${ARCH},live-boot,lvm2,parted,${PACKAGES}"
   fi
 
   if [ ! -e "${TEMPDIR}/bin" ]; then
-    debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,gnupg2,jq,libpam-systemd,locales,openssh-server,policykit-1,python3-minimal,sudo,usrmerge,unzip,"${PACKAGES}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${EXCLUDE}" "${VERSION}" "${TEMPDIR}" "http://${PROXY}deb.debian.org/debian"
+    debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,gnupg2,jq,libpam-systemd,locales,openssh-server,policykit-1,python3-minimal,sudo,usrmerge,unzip,"${PACKAGES}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${exclude}" "${VERSION}" "${TEMPDIR}" "http://${APTCACHER}deb.debian.org/debian"
   fi
 }
 
 function configure() {
   # Edit sources
   cat > "${TEMPDIR}/etc/apt/sources.list" << EOF
-deb http://${PROXY}deb.debian.org/debian ${VERSION} main contrib non-free
+deb http://${APTCACHER}deb.debian.org/debian ${VERSION} main contrib non-free
 EOF
-  if [ ${VERSION} = "buster" ]; then
+  if [ ${VERSION} = "bullseye" ]; then
     cat >> "${TEMPDIR}/etc/apt/sources.list" << EOF
-deb http://${PROXY}deb.debian.org/debian ${VERSION}-backports main contrib non-free
-deb http://${PROXY}deb.debian.org/debian ${VERSION}-updates main contrib non-free
-deb http://${PROXY}security.debian.org/debian-security ${VERSION}/updates main contrib non-free
+deb http://${APTCACHER}deb.debian.org/debian ${VERSION}-updates main contrib non-free
+deb http://${APTCACHER}security.debian.org/debian-security ${VERSION}-security main contrib non-free
 EOF
   fi
 
   # Dynamic hostname
   rm -f "${TEMPDIR}/etc/hostname" || true
-
-  # Disable timesync service for containers
-  if [ "${FEATCONTAINER}" ]; then
-    rm "${TEMPDIR}/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service" || true
-  fi
 
   cat > "${TEMPDIR}/usr/sbin/policy-rc.d" << EOF
 exit 101
@@ -200,8 +205,7 @@ EOF
     if ! grep -qs "${TEMPDIR}/proc" /proc/mounts; then
       mount -o bind /proc "${TEMPDIR}/proc"
     fi
-    rm "${TEMPDIR}/etc/resolv.conf"
-    echo "nameserver ${NAMESERVER}" > "${TEMPDIR}/etc/resolv.conf"
+    cp /etc/resolve.conf "${TEMPDIR}/etc/resolv.conf"
     chroot "${TEMPDIR}" /bin/bash -c "apt update && apt install -y ${ADDITIONAL}"
     rm "${TEMPDIR}/etc/resolv.conf"
     umount "${TEMPDIR}/dev"
@@ -218,7 +222,7 @@ DHCP=yes
 EOF
 
   # Enable services
-  for service in polkit systemd-networkd systemd-networkd-wait-online systemd-resolved; do
+  for service in polkit systemd-networkd systemd-networkd-wait-online systemd-resolved systemd-timesyncd; do
     ln -s "/lib/systemd/system/${service}.service" "${TEMPDIR}/etc/systemd/system/multi-user.target.wants" || true
   done
 
@@ -234,7 +238,7 @@ FallbackDNS=1.1.1.1
 EOF
 
   # Create user
-  chroot "${TEMPDIR}" useradd -c "${INITUSERNAME}" -d "${INITUSERHOME}" -mu 2000 "${INITUSERNAME}" || true
+  chroot "${TEMPDIR}" useradd -c "${USERNAME}" -d "${USERHOME}" -mu 2000 "${USERNAME}" || true
   cat > "${TEMPDIR}/etc/sudoers" << EOF
 Defaults env_reset
 Defaults mail_badpass
@@ -245,38 +249,22 @@ root ALL=(ALL:ALL) ALL
 %admin ALL=(ALL) NOPASSWD: ALL
 EOF
   chroot "${TEMPDIR}" groupadd admin || true
-  chroot "${TEMPDIR}" gpasswd -a "${INITUSERNAME}" admin || true
-  chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
-  chroot "${TEMPDIR}" mkdir -p "${INITUSERHOME}"/.ssh
-  chroot "${TEMPDIR}" touch "${INITUSERHOME}"/.ssh/authorized_keys
-  chroot "${TEMPDIR}" chown "${INITUSERNAME}:${INITUSERNAME}" "${INITUSERHOME}/.ssh"
-  cp "${INITUSERKEY}" "${TEMPDIR}${INITUSERHOME}"/.ssh/authorized_keys
+  chroot "${TEMPDIR}" gpasswd -a "${USERNAME}" admin || true
+  chroot "${TEMPDIR}" mkdir -p "${USERHOME}"/.ssh
+  chroot "${TEMPDIR}" mkdir -p "${USERHOME}"/.ssh
+  chroot "${TEMPDIR}" touch "${USERHOME}"/.ssh/authorized_keys
+  chroot "${TEMPDIR}" chown "${USERNAME}:${USERNAME}" "${USERHOME}/.ssh"
+  cp "${USERKEY}" "${TEMPDIR}${USERHOME}"/.ssh/authorized_keys
 
   # Set root password
   if [ "${PASSWORD}" ]; then
     echo "root:${PASSWORD}" | chpasswd -R "${TEMPDIR}"
   fi
-
-  if [ ${FEATIMAGE} ]; then
-    cat > "${TEMPDIR}/etc/systemd/system/growroot.service" << EOF
-[Unit]
-Description=Grow root partition
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'parted ---pretend-input-tty \$(mount | grep " / " | cut -d\  -f1) resizepart 1 yes 100%'
-ExecStart=/bin/bash -c 'resize2fs \$(mount | grep " / " | cut -d\  -f1)'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    ln -s /etc/systemd/system/growroot.service "${TEMPDIR}/etc/systemd/system/multi-user.target.wants/" || true
-  fi
 }
 
 function finalize() {
   chroot "${TEMPDIR}" apt clean
-  if [ "${FEATEFI}" ]; then
+  if [ "${BOOTLOADER}" == uefi ]; then
     cat > "${TEMPDIR}/etc/fstab" << EOF
 LABEL=efi /boot/efi vfat defaults 0 1
 EOF
@@ -294,7 +282,7 @@ for kernel in /boot/vmlinuz-*; do
 title Debian 10 - \${version}
 linux /vmlinuz-\${version}
 initrd /initrd.img-\${version}
-options ${OPTIONS} rw
+options ${BOOTOPTIONS} rw
 EOF
 done
 EOS
@@ -339,7 +327,7 @@ linux /vmlinuz
 initrd /initrd.img
 EOF
 
-    if [ "${FEATLUKS}" ]; then
+    if [ "${LUKS}" ]; then
       cat >> "${TEMPDIR}/etc/crypttab" << EOF
 luks LABEL=luks none luks,initramfs
 EOF
@@ -355,28 +343,36 @@ EOF
     chroot "${TEMPDIR}" /usr/local/sbin/generate_loaders.sh
   fi
 
-  if [ "${FEATIMAGE}" ]; then
+  if [ "${diskpath}" ]; then
     cat >> "${TEMPDIR}/etc/fstab" << EOF
 LABEL=root / ext4 defaults,noatime 0 1
 EOF
-    if [ ! "${FEATEFI}"]; then
+
+    if [ "${IMAGESWAP}" ]; then
       cat >> "${TEMPDIR}/etc/fstab" << EOF
-LABEL=root / ext4 defaults,noatime 0 1
+LABEL=swap none swap defaults 0 0
+EOF
+    fi
+
+    if [ "${BOOTLOADER}" != uefi ]; then
+      cat >> "${TEMPDIR}/etc/fstab" << EOF
+LABEL=boot /boot ext4 defaults,noatime 0 1
 EOF
       mount -o bind /dev "${TEMPDIR}/dev"
       mount -t proc /proc "${TEMPDIR}/proc"
       mount -t sysfs /sys "${TEMPDIR}/sys"
       sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
       sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
-      chroot "${TEMPDIR}" grub-install /dev/nbd0
+      chroot "${TEMPDIR}" grub-install "${diskpath}"
       chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
     fi
+
     umount -R "${TEMPDIR}"
     rmdir "${TEMPDIR}"
-    qemu-nbd -d /dev/nbd0
+    qemu-nbd -d /dev/nbd0 || true
   fi
 
-  if [ "${FEATSQUASH}" ]; then
+  if [ "${SQUASH}" ]; then
     mkdir -p "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d"
     cat > "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d/override.conf" << EOF
 [Service]
@@ -399,16 +395,16 @@ EOF
     umount "${TEMPDIR}/proc"
     cp -R "${TEMPDIR}/etc/systemd/system/serial-getty@ttyS0.service.d" "${TEMPDIR}/etc/systemd/system/getty@tty1.service.d"
     cp -R "${DIR}/forge.sh" "${TEMPDIR}/usr/local/bin/forge.sh"
-    mkdir -p "${OUTPUT}"
-    cp "${TEMPDIR}/vmlinuz" "${OUTPUT}/vmlinuz"
-    cp "${TEMPDIR}/initrd.img" "${OUTPUT}/initrd.img"
-    mksquashfs "${TEMPDIR}" "${OUTPUT}/root.squashfs" -e boot
-    cp -R /boot/efi/EFI "${OUTPUT}/EFI"
-    mkdir -p "${OUTPUT}/loader/entries"
-    cat >> "${OUTPUT}/loader/loader.conf" << EOF
+    mkdir -p "${OUTPUTPATH}"
+    cp "${TEMPDIR}/vmlinuz" "${OUTPUTPATH}/vmlinuz"
+    cp "${TEMPDIR}/initrd.img" "${OUTPUTPATH}/initrd.img"
+    mksquashfs "${TEMPDIR}" "${OUTPUTPATH}/root.squashfs" -e boot
+    cp -R /boot/efi/EFI "${OUTPUTPATH}/EFI"
+    mkdir -p "${OUTPUTPATH}/loader/entries"
+    cat >> "${OUTPUTPATH}/loader/loader.conf" << EOF
 default Debian
 EOF
-    cat >> "${OUTPUT}/loader/entries/debian.conf" << EOF
+    cat >> "${OUTPUTPATH}/loader/entries/debian.conf" << EOF
 title Debian
 linux /vmlinuz
 initrd /initrd.img
@@ -416,19 +412,17 @@ options boot=live fromiso=/root.squashfs toram
 EOF
   fi
 
-  if [ ${FEATFORMAT} ]; then
-    cat > "${TEMPDIR}/etc/fstab" << EOF
-LABEL=efi /boot/efi vfat defaults 0 0
-LABEL=home /home ext4 defaults 0 0
-LABEL=root / ext4 defaults 0 0
-LABEL=swap none swap defaults 0 0
-EOF
-    umount -R /mnt
-    swapoff /dev/disk/by-label/swap
-    vgchange -an /dev/lvm
-    if [ ${FEATLUKS} ]; then
-      cryptsetup close /dev/mapper/luks
+  if [ "${diskpath}" ]; then
+    umount -R /mnt || true
+    vgchange -an /dev/lvm || true
+
+    if [ "${LUKS}" ]; then
+      cryptsetup close /dev/mapper/luks || true
     fi
+  fi
+
+  if [ ! "${BOOTLOADER}" ]; then
+    mv "${TEMPDIR}" "${OUTPUTPATH}"
   fi
 }
 
@@ -443,97 +437,119 @@ fi
 
 while [ $# -gt 0 ]; do
   case "${1}" in
-    -a)
-      PROXY="${2}/"
+    -ac)
+      APTCACHER="${2}/"
       shift 2
     ;;
-    -b)
-      OPTIONS="${2}"
+    -ap)
+      ADDITIONAL="${2}"
+      shift 2
+    ;;
+    -ar)
+      case "${2}" in
+        amd64)
+          ARCH=amd64
+        ;;
+        arm64)
+          ARCH=arm64
+        ;;
+      esac
+      shift 2
+    ;;
+    -bl)
+      case "${2}" in
+        bios)
+          BOOTLOADER=bios
+        ;;
+        uboot)
+          BOOTLOADER=uboot
+        ;;
+        uefi)
+          BOOTLOADER=uefi
+        ;;
+      esac
+      shift 2
+    ;;
+    -bo)
+      BOOTOPTIONS="${2}"
       shift 2
     ;;
     -d)
       set -x
       shift 1
     ;;
-    -f)
-      FEATIMAGEFORMAT="${2}"
-      shift 2
-    ;;
     -h)
       show_usage
     ;;
-    -i)
-      ADDITIONAL="${2}"
-      shift 2
-    ;;
-    -l)
-      FEATLUKS=yes
-      shift 1
-    ;;
-    -m)
+    -if)
       case "${2}" in
-        cloud)
-          FEATIMAGE=yes
-          FEATLINUXAMD64=yes
+        qcow2)
+          IMAGEFORMAT=qcow2
         ;;
-        nspawn)
-          FEATCONTAINER=yes
-          FEATDIRECT=yes
-        ;;
-        qemu)
-          FEATEFI=yes
-          FEATLINUXAMD64=yes
-          FEATIMAGE=yes
-        ;;
-        physical-disk)
-          FEATDIRECT=yes
-          FEATEFI=yes
-          FEATFORMAT=yes
-          FEATLINUXAMD64=yes
-        ;;
-        physical-path)
-          FEATDIRECT=yes
-          FEATEFI=yes
-          FEATLINUXAMD64=yes
-        ;;
-        pxe)
-          FEATLINUXAMD64=yes
-          FEATSQUASH=yes
+        raw)
+          IMAGEFORMAT=raw
         ;;
       esac
       shift 2
     ;;
-    -n)
-      NAMESERVER="${2}"
+    -is)
+      IMAGESIZE="${2}"
       shift 2
     ;;
+    -iw)
+      IMAGESWAP="${2}"
+      shift 2
+    ;;
+    -l)
+      LUKS=yes
+      shift 1
+    ;;
     -o)
-      OUTPUT="${2}"
+      OUTPUTPATH="${2}"
       shift 2
     ;;
     -p)
       PASSWORD="${2}"
       shift 2
     ;;
+    -s)
+      SQUASH="${2}"
+      shift 2
+    ;;
     -t)
       TEMPDIR="${2}"
       shift 2
     ;;
-    -u)
-      INITUSERNAME="${2}"
-      shift 2
-    ;;
     -uh)
-      INITUSERHOME="${2}"
+      USERHOME="${2}"
       shift 2
     ;;
     -uk)
-      INITUSERKEY="${2}"
+      USERKEY="${2}"
+      shift 2
+    ;;
+    -un)
+      USERNAME="${2}"
+      shift 2
+    ;;
+    -uv)
+      UBOOTVERSION="${2}"
       shift 2
     ;;
     -v)
       VERSION="${2}"
       shift 2
+    ;;
+    disk)
+      diskpath="${OUTPUTPATH}"
+      shift 1
+    ;;
+    filesystem)
+      shift 1
+    ;;
+    image)
+      diskpath="/dev/nbd0"
+      shift 1
     ;;
     *)
       show_usage
@@ -544,15 +560,15 @@ if ! [ -x "$(command -v debootstrap)" ]; then
   INSTALLDEPS+=" debootstrap"
 fi
 
-if [ ${FEATEFI} ] && ! [ -x "$(command -v parted)" ]; then
+if [ "${EFI}" ] && ! [ -x "$(command -v parted)" ]; then
   INSTALLDEPS+=" parted"
 fi
 
-if [ ${FEATIMAGE} ] && ! [ -x "$(command -v qemu-nbd)" ]; then
+if [ "${diskpath}" == /dev/nbd0 ] && ! [ -x "$(command -v qemu-nbd)" ]; then
   INSTALLDEPS+=" qemu-utils"
 fi
 
-if [ ${FEATSQUASH} ] && ! [ -x "$(command -v mksquashfs)" ]; then
+if [ "${SQUASH}" ] && ! [ -x "$(command -v mksquashfs)" ]; then
   INSTALLDEPS+=" squashfs-tools"
 fi
 
@@ -561,6 +577,7 @@ if [ "${INSTALLDEPS}" ]; then
 fi
 
 provision
+mount
 install
 configure
 finalize
