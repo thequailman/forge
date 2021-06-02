@@ -91,8 +91,9 @@ function provision() {
           dd "if=${UBOOTITP}" conv=notrunc seek=16384 "of=${diskpath}"
           parted "${diskpath}" mkpart primary 24576s 200MiB
 	  sleep 1
-          mkfs.ext4 -L "boot${LABEL}" "${diskpath}${partition}1"
+          mkfs.vfat -n "boot${LABEL}" "${diskpath}${partition}1"
           parted "${diskpath}" mkpart primary 200MiB 100%
+	  BOOTLOADER=uefi
         ;;
         uefi)
           parted "${diskpath}" mkpart primary fat32 1MiB 200MiB
@@ -604,8 +605,9 @@ while [ $# -gt 0 ]; do
       shift 1
     ;;
     mount)
+      diskpath="${OUTPUTPATH}"
       mountfs
-      shift 1
+      exit
     ;;
     *)
       show_usage
