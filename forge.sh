@@ -4,19 +4,23 @@ set -eo pipefail
 ADDITIONAL=""
 APTCACHER=""
 ARCH="amd64"
+BINFMT=""
 BOOTLOADER=""
-BOOTOPTIONS="elevator=noop root=LABEL=root"
+BOOTOPTIONS="elevator=noop root=LABEL=root${LABLE}"
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 IMAGEFORMAT="qcow2"
 IMAGESIZE="10G"
 IMAGESWAP=""
 INSTALLDEPS=""
+LABEL=""
 LUKS=""
 OUTPUTPATH="./debian"
 OUTPUTTYPE="filesystem"
 PASSWORD=""
 SQUASH=""
 TEMPDIR="$(pwd)/tmp"
+UBOOTIDB=""
+UBOOTITP=""
 UBOOTVERSION="rockchip"
 USERHOME="/home/ansible"
 USERKEY="./id_rsa.pub"
@@ -25,9 +29,10 @@ VERSION="bullseye"
 
 diskpath=""
 exclude=""
+partition=""
 
 function show_usage() {
-  echo "Usage: $0 [arguments] [disk|filesystem|image]
+  echo "Usage: $0 [arguments] [disk|filesystem|image|mount]
 
 Arguments:
   -ac [apt-cacher-address]  apt-cacher-ng proxy
@@ -40,14 +45,17 @@ Arguments:
   -is [size]                image size (default: ${IMAGESIZE})
   -iw [size]                image swap size (default: none/no swap)
   -h                        show help
-  -l                        enable LUKS for image
+  -la                       append a custom label to partition names
+  -lu                       enable LUKS for image
   -o [path]                 output directory (filesystem), target disk (disk) or filename without extension (image) (default: ${OUTPUTPATH})
   -p [password]             root password (default: none)
   -s                        have output be squashfs
   -t [path]                 temporary files directory (default: ${TEMPDIR})
   -uh [path]                home dir for initial user (default: ${USERHOME})
+  -ui [path]                u-boot IDB path (idbloader.img) (default: none/no idb)
   -uk [filename]            filename for SSH public key to add to initial user (default: ${USERKEY})
   -un [username]            username for initial user (default: ${USERNAME})
+  -uo [path]                u-boot ITB path (u-boot.itb) (default: none/no itp)
   -uv [version]             u-boot version to install (default: ${UBOOTVERSION})
   -v [version]              debian version to install (default: buster)"
   exit 0
@@ -62,49 +70,54 @@ function provision() {
 
       sleep 1
     else
-      return
+      return 0
     fi
   fi
 
   if [ "${diskpath}" ]; then
-    if [ ! -e /dev/lvm/root ]; then
+    if [ ! -e "/dev/lvm${LABEL}/root${LABEL}" ]; then
       case "${BOOTLOADER}" in
         bios)
           parted "${diskpath}" mklabel msdos
-          parted "${diskpath}" mkpart primary 1MiB 200 MiB
+          parted "${diskpath}" mkpart primary 1MiB 200MiB
           parted "${diskpath}" set 1 boot on
-          mkfs.ext4 -L boot "${diskpath}1"
+	  sleep 1
+          mkfs.ext4 -L "boot${LABEL}" "${diskpath}${partition}1"
           parted "${diskpath}" mkpart primary 200MiB 100%
         ;;
         uboot)
           parted "${diskpath}" mklabel gpt
-          parted "${diskpath}" mkpart primary 1MiB 200 MiB
-          mkfs.ext4 -L boot "${diskpath}1"
+          dd "if=${UBOOTIDB}" conv=notrunc seek=64 "of=${diskpath}"
+          dd "if=${UBOOTITP}" conv=notrunc seek=16384 "of=${diskpath}"
+          parted "${diskpath}" mkpart primary 24576s 200MiB
+	  sleep 1
+          mkfs.ext4 -L "boot${LABEL}" "${diskpath}${partition}1"
           parted "${diskpath}" mkpart primary 200MiB 100%
         ;;
         uefi)
           parted "${diskpath}" mkpart primary fat32 1MiB 200MiB
           parted "${diskpath}" set 1 esp on
-          mkfs.vfat -n efi "${diskpath}1"
+	  sleep 1
+          mkfs.vfat -n "efi${LABEL}" "${diskpath}${partition}1"
           parted "${diskpath}" mkpart primary 200MiB 100%
         ;;
       esac
 
       if [ "${LUKS}" ]; then
-        cryptsetup --label luks -v luksFormat --type luks2 "${diskpath}2"
-        cryptsetup open /dev/disk/by-label/luks luks
-        vgcreate lvm /dev/mapper/luks
+        cryptsetup --label "luks${LABEL}" -v luksFormat --type luks2 "${diskpath}${partition}2"
+        cryptsetup open "/dev/disk/by-label/luks${LABEL}" "luks${LABEL}"
+        vgcreate "lvm${LABEL}" "/dev/mapper/luks${LABEL}"
       else
-        vgcreate lvm "${diskpath}2"
+        vgcreate "lvm${LABEL}" "${diskpath}${partition}2" || true
       fi
 
       if [ "${IMAGESWAP}" ]; then
-        lvcreate -n swap -L "${IMAGESWAP}" lvm
-        mkswap -L swap /dev/lvm/swap
+        lvcreate -n "swap${LABEL}" -L "${IMAGESWAP}" "lvm${LABEL}"
+        mkswap -L "swap${LABEL}" "/dev/lvm${LABEL}/swap${LABEL}"
       fi
 
-      lvcreate -n root -l "100%FREE" lvm
-      mkfs.ext4 -L root /dev/lvm/root
+      lvcreate -n "root${LABEL}" -l "100%FREE" "lvm${LABEL}"
+      mkfs.ext4 -L "root${LABEL}" "/dev/lvm${LABEL}/root${LABEL}"
     fi
   fi
 
@@ -118,11 +131,11 @@ function provision() {
   fi
 }
 
-function mount() {
+function mountfs() {
   mkdir -p "${TEMPDIR}"
 
   if [ "${diskpath}" ] && ! mount | grep "${TEMPDIR}"; then
-    if [ "${OUTPUTTYPE}" == image ]; then
+    if [ "${OUTPUTTYPE}" == image ] && ! parted /dev/nbd0 print; then
       modprobe nbd max_part=4
       qemu-nbd -c /dev/nbd0 -f "${IMAGEFORMAT}" "${OUTPUTPATH}"
 
@@ -130,14 +143,16 @@ function mount() {
     fi
 
     if [ "${LUKS}" ]; then
-      cryptsetup open /dev/disk/by-label/luks luks
+      cryptsetup open "/dev/disk/by-label/luks${LABEL}" "luks${LABEL}"
     fi
 
-    mount /dev/disk/by-label/root "${TEMPDIR}" || true
+    mount "/dev/disk/by-label/root${LABEL}" "${TEMPDIR}" || true
 
     if [ "${BOOTLOADER}" == uefi ]; then
       mkdir -p "${TEMPDIR}/boot/efi"
-      mount /dev/disk/by-label/efi "${TEMPDIR}/boot/efi" || true
+      mount "/dev/disk/by-label/efi${LABEL}" "${TEMPDIR}/boot/efi" || true
+    elif [ "${BOOTLOADER}" == bios ] || [ "${BOOTLOADER}" == uboot ]; then
+      mount "/dev/disk/by-label/boot${LABEL}" "${TEMPDIR}/boot" || true
     fi
   fi
 }
@@ -158,7 +173,7 @@ function install() {
   fi
 
   if [ "${LUKS}" ]; then
-    BOOTOPTIONS="resume=LABEL=swap root=LABEL=root,${BOOTOPTIONS}"
+    BOOTOPTIONS="resume=LABEL=swap${LABEL} root=LABEL=root${LABEL},${BOOTOPTIONS}"
     PACKAGES="cryptsetup,cryptsetup-initramfs,${PACKAGES}"
   fi
 
@@ -170,8 +185,20 @@ function install() {
     PACKAGES="cryptsetup,debootstrap,dosfstools,firmware-linux,firmware-iwlwifi,linux-image-${ARCH},live-boot,lvm2,parted,${PACKAGES}"
   fi
 
+  echo ${PACKAGES}
+
   if [ ! -e "${TEMPDIR}/bin" ]; then
-    debootstrap --arch "${ARCH}" --components=main,contrib,non-free --include apt-transport-https,ca-certificates,curl,dbus,gnupg2,jq,libpam-systemd,locales,openssh-server,policykit-1,python3-minimal,sudo,usrmerge,unzip,"${PACKAGES}" --exclude cron,ifupdown,iptables,logrotate,nano,rsyslog,"${exclude}" "${VERSION}" "${TEMPDIR}" "http://${APTCACHER}deb.debian.org/debian"
+    deboptions=""
+    if ! uname -a | grep "${ARCH}"; then
+      deboptions="--foreign"
+    fi
+
+    debootstrap "${deboptions}" --arch "${ARCH}" --components=main,contrib,non-free --include "apt-transport-https,ca-certificates,curl,dbus,gnupg2,jq,libpam-systemd,locales,openssh-server,policykit-1,python3-minimal,sudo,usrmerge,unzip,${PACKAGES}" --exclude "cron,ifupdown,iptables,logrotate,nano,rsyslog,${exclude}" "${VERSION}" "${TEMPDIR}" "http://${APTCACHER}deb.debian.org/debian"
+
+    if ! uname -a | grep "${ARCH}"; then
+      cp "/usr/bin/qemu-${BINFMT}-static" "${TEMPDIR}/usr/bin"
+      chroot "${TEMPDIR}" /debootstrap/debootstrap --second-stage
+    fi
   fi
 }
 
@@ -264,9 +291,10 @@ EOF
 
 function finalize() {
   chroot "${TEMPDIR}" apt clean
+
   if [ "${BOOTLOADER}" == uefi ]; then
     cat > "${TEMPDIR}/etc/fstab" << EOF
-LABEL=efi /boot/efi vfat defaults 0 1
+LABEL=efi${LABEL} /boot/efi vfat defaults 0 1
 EOF
 
     # Setup EFI copy
@@ -329,7 +357,7 @@ EOF
 
     if [ "${LUKS}" ]; then
       cat >> "${TEMPDIR}/etc/crypttab" << EOF
-luks LABEL=luks none luks,initramfs
+luks LABEL=luks${LABEL} none luks,initramfs
 EOF
       mount -o bind /dev "${TEMPDIR}/dev"
       mount -t sysfs /sys "${TEMPDIR}/sys"
@@ -345,31 +373,35 @@ EOF
 
   if [ "${diskpath}" ]; then
     cat >> "${TEMPDIR}/etc/fstab" << EOF
-LABEL=root / ext4 defaults,noatime 0 1
+LABEL=root${LABEL} / ext4 defaults,noatime 0 1
 EOF
 
     if [ "${IMAGESWAP}" ]; then
       cat >> "${TEMPDIR}/etc/fstab" << EOF
-LABEL=swap none swap defaults 0 0
+LABEL=swap${LABEL} none swap defaults 0 0
 EOF
     fi
 
-    if [ "${BOOTLOADER}" != uefi ]; then
+    if [ "${BOOTLOADER}" == bios ] || [ "${BOOTLOADER}" == uboot ]; then
       cat >> "${TEMPDIR}/etc/fstab" << EOF
-LABEL=boot /boot ext4 defaults,noatime 0 1
+LABEL=boot${LABEL} /boot ext4 defaults,noatime 0 1
 EOF
       mount -o bind /dev "${TEMPDIR}/dev"
       mount -t proc /proc "${TEMPDIR}/proc"
       mount -t sysfs /sys "${TEMPDIR}/sys"
-      sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
-      sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
-      chroot "${TEMPDIR}" grub-install "${diskpath}"
-      chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
-    fi
 
-    umount -R "${TEMPDIR}"
-    rmdir "${TEMPDIR}"
-    qemu-nbd -d /dev/nbd0 || true
+      if [ "${BOOTLOADER}" == bios ]; then
+        sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
+        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
+        chroot "${TEMPDIR}" grub-install "${diskpath}"
+	chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
+      fi
+
+      sleep 1
+      umount "${TEMPDIR}/dev"
+      umount "${TEMPDIR}/proc"
+      umount "${TEMPDIR}/sys"
+    fi
   fi
 
   if [ "${SQUASH}" ]; then
@@ -413,11 +445,13 @@ EOF
   fi
 
   if [ "${diskpath}" ]; then
-    umount -R /mnt || true
-    vgchange -an /dev/lvm || true
+    umount -R "${TEMPDIR}" || true
+    vgchange -an "/dev/lvm${LABEL}" || true
+    qemu-nbd -d /dev/nbd0 || true
+    rmdir "${TEMPDIR}"
 
     if [ "${LUKS}" ]; then
-      cryptsetup close /dev/mapper/luks || true
+      cryptsetup close "/dev/mapper/luks${LABEL}" || true
     fi
   fi
 
@@ -452,6 +486,7 @@ while [ $# -gt 0 ]; do
         ;;
         arm64)
           ARCH=arm64
+	  BINFMT=aarch64
         ;;
       esac
       shift 2
@@ -500,7 +535,11 @@ while [ $# -gt 0 ]; do
       IMAGESWAP="${2}"
       shift 2
     ;;
-    -l)
+    -la)
+      LABEL="-${2}"
+      shift 2
+    ;;
+    -lu)
       LUKS=yes
       shift 1
     ;;
@@ -513,8 +552,9 @@ while [ $# -gt 0 ]; do
       shift 2
     ;;
     -s)
+      BOOTLOADER=squash
       SQUASH="${2}"
-      shift 2
+      shift 1
     ;;
     -t)
       TEMPDIR="${2}"
@@ -524,12 +564,20 @@ while [ $# -gt 0 ]; do
       USERHOME="${2}"
       shift 2
     ;;
+    -ui)
+      UBOOTIDB="${2}"
+      shift 2
+    ;;
     -uk)
       USERKEY="${2}"
       shift 2
     ;;
     -un)
       USERNAME="${2}"
+      shift 2
+    ;;
+    -uo)
+      UBOOTITP="${2}"
       shift 2
     ;;
     -uv)
@@ -542,13 +590,21 @@ while [ $# -gt 0 ]; do
     ;;
     disk)
       diskpath="${OUTPUTPATH}"
+      OUTPUTTYPE=disk
       shift 1
     ;;
     filesystem)
+      OUTPUTTYPE=filesystem
       shift 1
     ;;
     image)
       diskpath="/dev/nbd0"
+      partition="p"
+      OUTPUTTYPE=image
+      shift 1
+    ;;
+    mount)
+      mountfs
       shift 1
     ;;
     *)
@@ -558,6 +614,14 @@ done
 
 if ! [ -x "$(command -v debootstrap)" ]; then
   INSTALLDEPS+=" debootstrap"
+fi
+
+if [ "${OUTPUTTYPE}" == image ] || [ "${OUTPUTTYPE}" == disk ] && ! [ -x "$(command -v vgcreate)" ]; then
+  INSTALLDEPS+=" lvm2"
+fi
+
+if ! uname -a | grep "${ARCH}" && ! [ -x "$(command -v /usr/bin/qemu-${BINFMT}-static)" ] ; then
+  INSTALLDEPS+=" binfmt-support qemu-user-static"
 fi
 
 if [ "${EFI}" ] && ! [ -x "$(command -v parted)" ]; then
@@ -577,7 +641,7 @@ if [ "${INSTALLDEPS}" ]; then
 fi
 
 provision
-mount
+mountfs
 install
 configure
 finalize
