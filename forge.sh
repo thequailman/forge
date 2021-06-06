@@ -31,6 +31,10 @@ diskpath=""
 exclude=""
 partition=""
 
+# mkpart primary 64s 16383s
+# mkpart primary 16384s 24575s
+# mkpart primary 24576s 32767s
+
 function show_usage() {
   echo "Usage: $0 [arguments] [disk|filesystem|image|mount]
 
@@ -84,16 +88,6 @@ function provision() {
 	  sleep 1
           mkfs.ext4 -L "boot${LABEL}" "${diskpath}${partition}1"
           parted "${diskpath}" mkpart primary 200MiB 100%
-        ;;
-        uboot)
-          parted "${diskpath}" mklabel gpt
-          dd "if=${UBOOTIDB}" conv=notrunc seek=64 "of=${diskpath}"
-          dd "if=${UBOOTITP}" conv=notrunc seek=16384 "of=${diskpath}"
-          parted "${diskpath}" mkpart primary 24576s 200MiB
-	  sleep 1
-          mkfs.vfat -n "boot${LABEL}" "${diskpath}${partition}1"
-          parted "${diskpath}" mkpart primary 200MiB 100%
-	  BOOTLOADER=uefi
         ;;
         uefi)
           parted "${diskpath}" mkpart primary fat32 1MiB 200MiB
@@ -152,7 +146,7 @@ function mountfs() {
     if [ "${BOOTLOADER}" == uefi ]; then
       mkdir -p "${TEMPDIR}/boot/efi"
       mount "/dev/disk/by-label/efi${LABEL}" "${TEMPDIR}/boot/efi" || true
-    elif [ "${BOOTLOADER}" == bios ] || [ "${BOOTLOADER}" == uboot ]; then
+    elif [ "${BOOTLOADER}" == bios ]; then
       mount "/dev/disk/by-label/boot${LABEL}" "${TEMPDIR}/boot" || true
     fi
   fi
@@ -169,10 +163,6 @@ function install() {
     PACKAGES="grub2,parted,${PACKAGES}"
   fi
 
-  if [ "${BOOTLOADER}" == uboot ]; then
-    PACKAGES="u-boot-${UBOOTVERSION},${PACKAGES}"
-  fi
-
   if [ "${LUKS}" ]; then
     BOOTOPTIONS="resume=LABEL=swap${LABEL} root=LABEL=root${LABEL},${BOOTOPTIONS}"
     PACKAGES="cryptsetup,cryptsetup-initramfs,${PACKAGES}"
@@ -185,8 +175,6 @@ function install() {
   if [ "${FEATSQUASH}" ]; then
     PACKAGES="cryptsetup,debootstrap,dosfstools,firmware-linux,firmware-iwlwifi,linux-image-${ARCH},live-boot,lvm2,parted,${PACKAGES}"
   fi
-
-  echo ${PACKAGES}
 
   if [ ! -e "${TEMPDIR}/bin" ]; then
     deboptions=""
@@ -342,7 +330,13 @@ EOF
 
     # Setup systemd-bootd
     if [ ! -e "${TEMPDIR}/boot/efi/loader" ]; then
-      bootctl --path "${TEMPDIR}/boot/efi" install
+      mount -o bind /dev "${TEMPDIR}/dev"
+      mount -t sysfs /sys "${TEMPDIR}/sys"
+      mount -t proc /proc "${TEMPDIR}/proc"
+      chroot "${TEMPDIR}" bootctl --path "${TEMPDIR}/boot/efi" install
+      umount "${TEMPDIR}/dev"
+      umount "${TEMPDIR}/sys"
+      umount "${TEMPDIR}/proc"
     fi
 
     cat > "${TEMPDIR}/boot/efi/loader/loader.conf" << EOF
@@ -383,7 +377,7 @@ LABEL=swap${LABEL} none swap defaults 0 0
 EOF
     fi
 
-    if [ "${BOOTLOADER}" == bios ] || [ "${BOOTLOADER}" == uboot ]; then
+    if [ "${BOOTLOADER}" == bios ]; then
       cat >> "${TEMPDIR}/etc/fstab" << EOF
 LABEL=boot${LABEL} /boot ext4 defaults,noatime 0 1
 EOF
@@ -391,12 +385,10 @@ EOF
       mount -t proc /proc "${TEMPDIR}/proc"
       mount -t sysfs /sys "${TEMPDIR}/sys"
 
-      if [ "${BOOTLOADER}" == bios ]; then
-        sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
-        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
-        chroot "${TEMPDIR}" grub-install "${diskpath}"
-	chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
-      fi
+      sed -i 's/#GRUB_TERMINAL/GRUB_TERMINAL/g' "${TEMPDIR}/etc/default/grub"
+      sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=""/g' "${TEMPDIR}/etc/default/grub"
+      chroot "${TEMPDIR}" grub-install "${diskpath}"
+      chroot "${TEMPDIR}" grub-mkconfig -o /boot/grub/grub.cfg
 
       sleep 1
       umount "${TEMPDIR}/dev"
