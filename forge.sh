@@ -10,7 +10,6 @@ BOOTOPTIONS="elevator=noop root=LABEL=root${LABLE}"
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 IMAGEFORMAT="qcow2"
 IMAGESIZE="10G"
-IMAGESWAP=""
 INSTALLDEPS=""
 LABEL=""
 LUKS=""
@@ -18,7 +17,9 @@ OUTPUTPATH="./debian"
 OUTPUTTYPE="filesystem"
 PASSWORD=""
 SQUASH=""
+SWAPSIZE=""
 TEMPDIR="$(pwd)/tmp"
+UBOOT=""
 UBOOTIDB=""
 UBOOTITP=""
 UBOOTVERSION="rockchip"
@@ -31,10 +32,6 @@ diskpath=""
 exclude=""
 partition=""
 
-# mkpart primary 64s 16383s
-# mkpart primary 16384s 24575s
-# mkpart primary 24576s 32767s
-
 function show_usage() {
   echo "Usage: $0 [arguments] [disk|filesystem|image|mount]
 
@@ -46,15 +43,16 @@ Arguments:
   -bo                       boot options
   -d                        enable debugging
   -if                       image format (qcow2, raw) (default: ${IMAGEFORMAT})
-  -is [size]                image size (default: ${IMAGESIZE})
   -iw [size]                image swap size (default: none/no swap)
   -h                        show help
   -la                       append a custom label to partition names
   -lu                       enable LUKS for image
   -o [path]                 output directory (filesystem), target disk (disk) or filename without extension (image) (default: ${OUTPUTPATH})
   -p [password]             root password (default: none)
-  -s                        have output be squashfs
+  -sq                       have output be squashfs
+  -sw [size]                swap size (default: none/no swap)
   -t [path]                 temporary files directory (default: ${TEMPDIR})
+  -ub                       setup u-boot
   -uh [path]                home dir for initial user (default: ${USERHOME})
   -ui [path]                u-boot IDB path (idbloader.img) (default: none/no idb)
   -uk [filename]            filename for SSH public key to add to initial user (default: ${USERKEY})
@@ -80,49 +78,52 @@ function provision() {
 
   if [ "${diskpath}" ]; then
     if [ ! -e "/dev/lvm${LABEL}/root${LABEL}" ]; then
-      case "${BOOTLOADER}" in
-        bios)
-          parted "${diskpath}" mklabel msdos
-          parted "${diskpath}" mkpart primary 1MiB 200MiB
-          parted "${diskpath}" set 1 boot on
-	  sleep 1
-          mkfs.ext4 -L "boot${LABEL}" "${diskpath}${partition}1"
-          parted "${diskpath}" mkpart primary 200MiB 100%
-        ;;
-        uefi)
-          parted "${diskpath}" mkpart primary fat32 1MiB 200MiB
-          parted "${diskpath}" set 1 esp on
-	  sleep 1
-          mkfs.vfat -n "efi${LABEL}" "${diskpath}${partition}1"
-          parted "${diskpath}" mkpart primary 200MiB 100%
-        ;;
-      esac
+      if [ "${UBOOT}" ]; then
+        parted "${diskpath}" mklabel gpt
+        dd "if=${UBOOTIDB}" conv=notrunc seek=64 "of=${diskpath}"
+        dd "if=${UBOOTITP}" conv=notrunc seek=16384 "of=${diskpath}"
+        parted "${diskpath}" mkpart primary 32768s 442367s
+        parted "${diskpath}" set 1 esp on
+        sleep 1
+        mkfs.vfat -n "efi${LABEL}" "${diskpath}${partition}1"
+        parted "${diskpath}" mkpart primary 442368s 100%
+      else
+        case "${BOOTLOADER}" in
+          bios)
+            parted "${diskpath}" mklabel msdos
+            parted "${diskpath}" mkpart primary 1MiB 200MiB
+            parted "${diskpath}" set 1 boot on
+	    sleep 1
+            mkfs.ext4 -L "boot${LABEL}" "${diskpath}${partition}1"
+            parted "${diskpath}" mkpart primary 200MiB 100%
+          ;;
+          uefi)
+            parted "${diskpath}" mkpart primary fat32 1MiB 200MiB
+            parted "${diskpath}" set 1 esp on
+	    sleep 1
+            mkfs.vfat -n "efi${LABEL}" "${diskpath}${partition}1"
+            parted "${diskpath}" mkpart primary 200MiB 100%
+          ;;
+        esac
+      fi
 
       if [ "${LUKS}" ]; then
         cryptsetup --label "luks${LABEL}" -v luksFormat --type luks2 "${diskpath}${partition}2"
         cryptsetup open "/dev/disk/by-label/luks${LABEL}" "luks${LABEL}"
         vgcreate "lvm${LABEL}" "/dev/mapper/luks${LABEL}"
       else
-        vgcreate "lvm${LABEL}" "${diskpath}${partition}2" || true
+        vgcreate "lvm${LABEL}" "${diskpath}${partition}2"
       fi
 
-      if [ "${IMAGESWAP}" ]; then
-        lvcreate -n "swap${LABEL}" -L "${IMAGESWAP}" "lvm${LABEL}"
+      if [ "${SWAPSIZE}" ]; then
+        lvcreate -n "swap${LABEL}" -L "${SWAPSIZE}" "lvm${LABEL}"
         mkswap -L "swap${LABEL}" "/dev/lvm${LABEL}/swap${LABEL}"
       fi
 
       lvcreate -n "root${LABEL}" -l "100%FREE" "lvm${LABEL}"
       mkfs.ext4 -L "root${LABEL}" "/dev/lvm${LABEL}/root${LABEL}"
+      sleep 1
     fi
-  fi
-
-  if [ "${FEATIMAGE}" ]; then
-    mkfs.ext4 -L "root" "${FEATIMAGEROOT}"
-    qemu-nbd -d /dev/nbd0
-
-    qemu-nbd -c /dev/nbd0 -f "${FEATIMAGEFORMAT}" "${IMAGENAME}"
-    sleep 1
-
   fi
 }
 
@@ -333,7 +334,7 @@ EOF
       mount -o bind /dev "${TEMPDIR}/dev"
       mount -t sysfs /sys "${TEMPDIR}/sys"
       mount -t proc /proc "${TEMPDIR}/proc"
-      chroot "${TEMPDIR}" bootctl --path "${TEMPDIR}/boot/efi" install
+      chroot "${TEMPDIR}" bootctl --esp-path "${TEMPDIR}/boot/efi" install || true
       umount "${TEMPDIR}/dev"
       umount "${TEMPDIR}/sys"
       umount "${TEMPDIR}/proc"
@@ -371,7 +372,7 @@ EOF
 LABEL=root${LABEL} / ext4 defaults,noatime 0 1
 EOF
 
-    if [ "${IMAGESWAP}" ]; then
+    if [ "${SWAPSIZE}" ]; then
       cat >> "${TEMPDIR}/etc/fstab" << EOF
 LABEL=swap${LABEL} none swap defaults 0 0
 EOF
@@ -489,9 +490,6 @@ while [ $# -gt 0 ]; do
         bios)
           BOOTLOADER=bios
         ;;
-        uboot)
-          BOOTLOADER=uboot
-        ;;
         uefi)
           BOOTLOADER=uefi
         ;;
@@ -524,10 +522,6 @@ while [ $# -gt 0 ]; do
       IMAGESIZE="${2}"
       shift 2
     ;;
-    -iw)
-      IMAGESWAP="${2}"
-      shift 2
-    ;;
     -la)
       LABEL="-${2}"
       shift 2
@@ -544,14 +538,23 @@ while [ $# -gt 0 ]; do
       PASSWORD="${2}"
       shift 2
     ;;
-    -s)
+    -sq)
       BOOTLOADER=squash
-      SQUASH="${2}"
+      SQUASH=yes
       shift 1
+    ;;
+    -sw)
+      SWAPSIZE="${2}"
+      shift 2
     ;;
     -t)
       TEMPDIR="${2}"
       shift 2
+    ;;
+    -ub)
+      BOOTLOADER=uefi
+      UBOOT=yes
+      shift 1
     ;;
     -uh)
       USERHOME="${2}"
